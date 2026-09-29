@@ -37,8 +37,7 @@
 若要自行執行原始碼，才需要另外裝 Python 3.10 以上版本：
 
 ```bat
-pip install -r requirements.txt
-python -m playwright install chromium
+build.bat
 ```
 
 ### 第二步：啟動
