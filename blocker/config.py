@@ -30,11 +30,11 @@ class Settings:
     keywords: List[str] = field(default_factory=lambda: ["foodie"])
     # 每輪最多封鎖數（保守值，避免觸發 IG 風控）
     max_per_run: int = 10
-    # 每輪會錯對平台最多實際触发對方對象次數。
-    # 這個是「上限」的安全網：對方沒被真的封鎖時
-    # （例如 Threads 改版找不到選單），max_per_run 永遠不會满，
+    # 每輪兩個平台合計最多實際觸發幾個候選帳號。
+    # 這是「上限」的安全網：當對象沒有被真的封鎖時
+    # （例如 Threads 改版找不到選單），max_per_run 永遠不會滿，
     # 程式會把幾十上百個候選全跑完，看起來就是無限持續。
-    # 0 = 自動推測（至少 max_per_run 的 3 個，不少於 30）
+    # 0 = 自動推測（至少 max_per_run 的 3 倍，不少於 30）
     max_try_per_run: int = 60
     # 每日排程時間，格式 "HH:MM"，可多筆
     schedule_times: List[str] = field(default_factory=lambda: ["12:00", "22:00"])
@@ -54,8 +54,10 @@ class Settings:
     # 封鎖時是否勾選「連帶封鎖此帳號未來建立的其他帳號」
     # 注意：IG 網頁版目前已移除這個選項，此設定只在 IG 重新加回來時才有效。
     block_future_accounts: bool = True
-    # 演練模式：只搜尋 + 判斷 + 列出會封誰，完全不點封鎖（第一次用請先開這個）
-    dry_run: bool = False
+    # 演練模式：只搜尋 + 判斷 + 列出會封誰，完全不點封鎖。
+    # 預設 True —— 新使用者第一次開程式時不該直接對真人帳號下封鎖，
+    # 要真的封鎖得自己進設定取消勾選，這道防呆不該留給舊設定檔。
+    dry_run: bool = True
     # 存檔除錯截圖到 debug 資料夾
     debug_screenshots: bool = True
 

@@ -121,6 +121,8 @@ class InstagramBlocker:
         # 目前正在處理的帳號（「點 ID 旁邊的 ⋯」備援策略要用）
         self._current_username: str = ""
         self._landing_page = "https://www.instagram.com/explore/"
+        # _ready() 確認過登入後就記住，這一輪不必每個關鍵字都重新導頁
+        self._ready_ok = False
         # 由 worker 注入，讓每個等待都能被「停止」打斷
         self.stop_event = None
 
@@ -169,11 +171,11 @@ class InstagramBlocker:
                 raise
 
     def _goto_profile(self, username: str, tries: int = 4) -> bool:
-        """導到某人的個人主頁，並**確認真的停在那裡**。
+        """導到某人的個人主頁，並確認網址真的還停在那裡。
 
-        為什麼需要這個：_goto() 只等到 domcontentloaded 就回傳，但 IG 是前端
-        渲染的，載入後還會做一次 client-side 導覽，實測會把頁面換成別的帳號
-        （推薦帳號之類的）。所以導覽後要反覆確認網址，���對就重導。
+        導覽後反覆確認網址，不對就重導。這是對 IG 前端渲染的保險措施：
+        page.goto() 只等到 domcontentloaded 就回傳，而 IG 載入後還會做一次
+        client-side 導覽，偶爾會把頁面換掉。回傳 True 代表確定停在目標帳號。
         """
         target = f"https://www.instagram.com/{username}/"
         want = username.strip().strip("/").lower()
@@ -235,7 +237,14 @@ class InstagramBlocker:
             pass
 
     def _ready(self) -> bool:
-        """把瀏覽器帶到一個已登入、可發 API 請求的頁面。"""
+        """把瀏覽器帶到一個已登入、可發 API 請求的頁面。
+
+        這一輪只要確認過一次就够了 —— 每個關鍵字都重新導頁會白白多花
+        好幾秒（實測一個關鍵字要 7 秒左右），而 session 在一輪內不會無故失效。
+        真的失效時，後續的搜尋與開主頁都會失敗並記錄在 log，不會被忽略。
+        """
+        if self._ready_ok:
+            return True
         try:
             self._goto(self._landing_page, timeout=30.0)
             if not self._wait(2.5):
@@ -243,6 +252,7 @@ class InstagramBlocker:
             if "/accounts/login" in self.page.url:
                 self.log(t("r_login_expired", platform="Instagram"))
                 return False
+            self._ready_ok = True
             return True
         except _Stopped:
             return False
@@ -309,45 +319,198 @@ class InstagramBlocker:
     # ---------- 搜尋 ----------
     def _api_topsearch(self, keyword: str) -> List[dict]:
         """呼叫 IG 的搜尋建議 API，回傳結構化帳號清單。"""
+        return self._api_topsearch_many([keyword])
+
+    def _api_topsearch_many(self, queries: List[str]) -> List[dict]:
+        """一次並行打多個搜尋 API 查詢，回傳合併去重後的帳號清單。
+
+        為什麼要並行：每個查詢字串單獨打要 1.9 秒左右，8 個字串循序打就是
+        21 秒。改成在瀏覽器裡 Promise.all 一次發出後只要 3 秒（實測結果完全
+        一樣、沒有任何 HTTP 錯誤）。連續快速打 API 確實會整批收到 HTTP 500，
+        但那是在完全沒有間隔的情況下；一次 8 個並行請求實測是正常的。
+        真的有問題時會退回去逐個打。
+        """
+        if not queries:
+            return []
+        users = self._api_topsearch_parallel(queries)
+        if not users and len(queries) > 1:
+            self.log("  [search] parallel query failed, retrying one by one")
+            for q in queries:
+                for item in self._api_topsearch_parallel([q]):
+                    key = item.get("username", "").lower()
+                    if key in self._meta and self._meta[key] is item:
+                        continue
+                    users.append(item)
+        return users
+
+    def _api_topsearch_parallel(self, queries: List[str]) -> List[dict]:
+        """實際執行並行查詢，並把結果塞進 self._meta。"""
         try:
-            raw = self.page.evaluate(
-                """async (q) => {
-                    const r = await fetch(
-                        '/web/search/topsearch/?query=' + encodeURIComponent(q) + '&context=blended',
-                        {headers: {'X-IG-App-ID': '936619743392459',
-                                   'X-Requested-With': 'XMLHttpRequest'},
-                         credentials: 'include'});
-                    if (!r.ok) return {error: 'HTTP ' + r.status};
-                    return {text: await r.text()};
+            replies = self.page.evaluate(
+                """async (queries) => {
+                    const one = async (q) => {
+                        try {
+                            const r = await fetch(
+                                '/web/search/topsearch/?query='
+                                    + encodeURIComponent(q) + '&context=blended',
+                                {headers: {'X-IG-App-ID': '936619743392459',
+                                           'X-Requested-With': 'XMLHttpRequest'},
+                                 credentials: 'include'});
+                            if (!r.ok) return {q: q, err: 'HTTP ' + r.status};
+                            return {q: q, text: await r.text()};
+                        } catch (e) {
+                            return {q: q, err: String(e).slice(0, 60)};
+                        }
+                    };
+                    return Promise.all(queries.map(one));
                 }""",
-                keyword,
+                list(queries),
             )
         except Exception as e:
             self.log(f"  [search] API call failed: {str(e)[:80]}")
             return []
-        if not raw or raw.get("error"):
-            self.log(f"  [search] API error: {raw.get('error') if raw else 'no response'}")
-            return []
-        try:
-            data = json.loads(raw["text"])
-        except Exception as e:
-            self.log(f"  [search] cannot parse API reply: {str(e)[:80]}")
+        if not replies:
             return []
 
-        users = []
-        for entry in (data.get("users") or []):
-            u = entry.get("user") or {}
-            username = (u.get("username") or "").strip()
-            if not username:
+        users: List[dict] = []
+        seen = set()
+        errors = []
+        for reply in replies:
+            if not isinstance(reply, dict):
+                continue
+            if reply.get("err"):
+                errors.append("%s:%s" % (reply.get("q", "?"), reply["err"]))
+                continue
+            try:
+                data = json.loads(reply.get("text") or "")
+            except Exception:
+                continue
+            for entry in (data.get("users") or []):
+                u = entry.get("user") or {}
+                username = (u.get("username") or "").strip()
+                if not username or username.lower() in seen:
+                    continue
+                seen.add(username.lower())
+                item = {
+                    "username": username,
+                    "full_name": u.get("full_name") or "",
+                    "is_verified": bool(u.get("is_verified")),
+                    "friendship_status": u.get("friendship_status") or {},
+                }
+                self._meta[username.lower()] = item
+                users.append(item)
+        if errors:
+            self.log("  [search] some queries failed: " + ", ".join(errors[:4]))
+        return users
+
+    def _read_suggestions(self) -> List[dict]:
+        """讀取搜尋框下拉建議列裡的「純帳號頁」連結。
+
+        /reels/、/explore/、/popular/ 等導航路徑會被正則排除。
+        """
+        rows = self.page.evaluate("""() => {
+          const out = [];
+          document.querySelectorAll('a[href^="/"]').forEach(a => {
+            const h = a.getAttribute('href') || '';
+            if (!/^\\/[A-Za-z0-9._]{1,30}\\/?$/.test(h)) return;
+            const r = a.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return;
+            out.push({href: h.replace(/\\/$/, ''),
+                      txt: (a.innerText || '').replace(/\\n/g, ' ').trim()});
+          });
+          return out;
+        }""")
+        return rows or []
+
+    def _suggest_api(self, keyword: str) -> List[dict]:
+        """從 IG 原生搜尋框的下拉建議列抓帳號。
+
+        為什麼需要這個：`/web/search/topsearch/` **永遠只回 5 筆**（實測
+        2026/09，各頁面狀態、各 App-ID 都一樣，回應裡 `has_more` 雖然是 true
+        但那個端點不提供分頁參數）。所以單靠 API 一輪最多只有 5 個候選，
+        扣掉藍勾勾與大粉絲後常常剩 0~2 個 → 「不到 10 個就結束」。
+
+        這裡走瀏覽器自己的搜尋框，建議列是另一條後端路徑，會給出更多結果。
+        """
+        try:
+            self._goto("https://www.instagram.com/explore/")
+            self._wait(2500 / 1000)
+        except Exception as e:
+            self.log(f"  [suggest] cannot open /explore/: {str(e)[:70]}")
+            return []
+
+        si = None
+        for sel in [
+            'input[placeholder="搜尋"]',
+            'input[placeholder="Search"]',
+            'input[aria-label*="搜尋"]',
+            'input[aria-label*="Search"]',
+            'input[type="search"]',
+        ]:
+            try:
+                found = self.page.query_selector(sel)
+            except Exception:
+                found = None
+            if found:
+                si = found
+                break
+        if not si:
+            self.log("  [suggest] no search box on this page")
+            return []
+
+        try:
+            si.click(force=True)
+            if not self._wait(0.6):
+                return []
+            si.fill("")
+            si.type(keyword, delay=130)
+            # 建議列是漸進渲染的：實測 type 完當下只有 8 筆，
+            # 再等約 1.5 秒才長到 14 筆。所以要輪詢等它穩定。
+            rows: List[dict] = []
+            for _ in range(16):
+                if not self._wait(0.4):
+                    break
+                try:
+                    cur = self._read_suggestions()
+                except Exception:
+                    cur = []
+                if len(cur) > len(rows):
+                    rows = cur
+                if len(rows) >= 5:
+                    break
+            if not rows:
+                self.log("  [suggest] suggestion list stayed empty")
+                return []
+        except _Stopped:
+            return []
+        except Exception as e:
+            self.log(f"  [suggest] typing failed: {type(e).__name__}: {str(e)[:70]}")
+            return []
+
+        users: List[dict] = []
+        for row in (rows or []):
+            m = re.fullmatch(r"/([A-Za-z0-9._]{1,30})", row.get("href") or "")
+            if not m:
+                continue
+            username = m.group(1)
+            if username.lower() in ("reels", "explore", "popular", "stories"):
+                continue
+            # API 先跑，若已有資料就沿用（is_verified 資訊比較好），
+            # 但**不能因為已有就跳過** —— 那會讓建議列整個被丟掉。
+            prev = self._meta.get(username.lower())
+            if prev and prev.get("is_verified") is not None:
+                users.append(prev)
                 continue
             item = {
                 "username": username,
-                "full_name": u.get("full_name") or "",
-                "is_verified": bool(u.get("is_verified")),
-                "friendship_status": u.get("friendship_status") or {},
+                "full_name": (row.get("txt") or "")[:60],
+                # 建議列不提供驗證/追蹤狀態，交給開主頁後判斷
+                "is_verified": None,
+                "friendship_status": {},
             }
             self._meta[username.lower()] = item
             users.append(item)
+        self.log(f"  [suggest] {len(users)} from search box")
         return users
 
     def _dom_fallback(self, keyword: str) -> List[dict]:
@@ -416,6 +579,41 @@ class InstagramBlocker:
             users.append(item)
         return users
 
+    # 一輪最多用幾種寫法去查 IG 的搜尋 API。實測 8 種就足以拿到 25 筆以上
+    # 不重複的原始結果，再多只是徒增請求次數與被風控的機率。
+    MAX_SEARCH_QUERIES = 8
+
+    def _query_variants(self, keyword: str) -> List[str]:
+        """產生多種搜尋寫法，用來把候選池撐大。
+
+        為什麼需要：IG 的 `/web/search/topsearch/` **對同一個字串永遠只回 5 筆**。
+        回應裡雖然帶了 `has_more: true`，但那個端點不接受任何分頁參數
+        （實測 2026/09，各頁面狀態、各 App-ID 都一樣）。
+
+        好消息是「不同字串會回完全不同的 5 筆」：
+
+            "foodie"  -> 4foodie / 52_foodie / fourshark_foodie / foodieamber / aa__foodie
+            "foodie_" -> foodie_._1 / foodies__eric.sharon / foodie_april / ...
+            "_foodie" -> _foodie105 / foodieinyilan / ericlife_korea_foodie / ...
+            "foodi"   -> 4foodie / 52_foodie / jc_foodidi / foodiesunny_ / foodie_yi06
+
+        而且逐字縮短的前綴（f / fo / foo / ...）也各自給不同結果，
+        累積起來遠超過 5 個。所以改用多種寫法輪詢，把不重複的帳號累積起來。
+        這也讓「關鍵字字面比對」能發揮作用：不相關的結果會被 _prefilter 擋掉。
+        """
+        k = keyword.strip()
+        out = [k]
+        # IG 帳號常用底線裝飾，先試這些變體
+        for v in (k + "_", "_" + k, k + "1", "a" + k):
+            if v not in out:
+                out.append(v)
+        # 再試逐字縮短的前綴，由長到短
+        for n in range(len(k) - 1, 1, -1):
+            v = k[:n]
+            if v not in out:
+                out.append(v)
+        return out
+
     def search_accounts(self, keyword: str) -> List[str]:
         """搜尋關鍵字，回傳值得檢查的帳號清單。"""
         keyword = keyword.strip()
@@ -424,20 +622,37 @@ class InstagramBlocker:
         if not self._ready():
             return []
 
-        users = self._api_topsearch(keyword)
+        # 單一查詢字串只有 5 筆，所以用多種寫法累積（見 _query_variants）
+        variants = self._query_variants(keyword)[:self.MAX_SEARCH_QUERIES]
+        merged: List[dict] = []
+        seen = set()
+        for item in (self._api_topsearch_many(variants) or []):
+            key = (item.get("username") or "").lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+        used = len(variants)
+
         source = "search API"
-        if not users:
-            self.log("  [search] API gave nothing, using the web fallback")
-            users = self._dom_fallback(keyword)
-            source = "web fallback"
-        if not users:
+        if not merged:
+            # API 整批掛掉時才退回去走瀏覽器原生搜尋框
+            self.log("  [search] API gave nothing, trying the search box")
+            merged = self._suggest_api(keyword)
+            source = "search box"
+        if not merged:
+            self.log("  [search] search box gave nothing, trying DOM fallback")
+            merged = self._dom_fallback(keyword)
+            source = "DOM fallback"
+
+        if not merged:
             self._debug_screenshot(f"nosearch_{keyword}")
             self.log(f"[IG] keyword \"{keyword}\": no candidates found")
             return []
 
-        candidates = self._prefilter(users, keyword)
-        self.log(f"[IG] \"{keyword}\" via {source}: {len(users)} raw -> "
-                 f"{len(candidates)} candidates: {candidates[:10]}")
+        candidates = self._prefilter(merged, keyword)
+        self.log(f"[IG] \"{keyword}\" via {source} ({used} queries): "
+                 f"{len(merged)} raw -> {len(candidates)} candidates: {candidates[:12]}")
         if not candidates:
             self._debug_screenshot(f"allfiltered_{keyword}")
         return candidates
