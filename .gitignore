@@ -20,3 +20,10 @@ venv/
 build/
 dist/
 *.spec
+
+# 環境設定（含 token）
+.env
+# 備份的登入狀態
+.bak_credentials
+*.env
+
