@@ -1,0 +1,22 @@
+# 敏感狀態檔（不要上傳 GitHub）
+ig_state.json
+threads_state.json
+config.json
+blocked_log.csv
+
+# 執行期產生的檔案
+lang.txt
+crash.log
+debug/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
