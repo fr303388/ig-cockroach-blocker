@@ -1,9 +1,9 @@
-# 蟒螂封鎖器（IG / Threads Cockroach Blocker）
+# 蟑螂封鎖器（IG / Threads Cockroach Blocker）
 
 > **v0.11** · 支援 繁體中文 / 簡體中文 / 日本語 / English
 > · Instagram 與 Threads 同時並行執行 · 不需程式能力
 
-定期在 **Instagram 網頁版** 與 **Threads 網頁版**，自動批次封鎖名稱含指定關鍵字的驞據對象，並連帶封鎖該使用者未來開的新對象。給完全不懂程式的人用：開視窗、輸入關鍵字、按幾個按鈕就好。
+定期在 **Instagram 網頁版** 與 **Threads 網頁版**，自動批次封鎖名稱含指定關鍵字的蟑螂對象，並連帶封鎖該使用者未來開的新對象。給完全不懂程式的人用：開視窗、輸入關鍵字、按幾個按鈕就好。
 
 ---
 
@@ -35,17 +35,19 @@
 下載整個資料夾後，確認你電腦有裝 Python 3.10 以上版本，然後：
 
 ```bat
-pip install -r requirements.txt
-python -m playwright install chromium
+build.bat
 ```
 
 ### 第二步：啟動
 
 ```bat
-python main.py
+\ig-cockroach-blocker\dist\CockroachBlocker\CockroachBlocker.exe
 ```
 
-會出現一個視窗，三個分頁。
+### 第三步：字形(選裝)
+```bat
+install_fonts.bat
+```
 
 ### 第三步：設定 + 登入
 
